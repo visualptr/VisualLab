@@ -28,6 +28,7 @@ public sealed class Plugin : LabApi.Loader.Features.Plugins.Plugin<Config>
     private PluginStore _store;
     private CoroutineHandle _pump;
     private bool _opening;
+    private bool _keepingAwake;
 
     /// <summary>Gets the active plugin instance.</summary>
     public static Plugin Instance { get; private set; }
@@ -42,7 +43,7 @@ public sealed class Plugin : LabApi.Loader.Features.Plugins.Plugin<Config>
     public override string Author => "VisualLab";
 
     /// <summary>Gets the plugin version.</summary>
-    public override Version Version => new (0, 1, 2);
+    public override Version Version => new (0, 2, 0);
 
     /// <summary>Gets the minimum supported LabAPI version.</summary>
     public override Version RequiredApiVersion => new (1, 1, 4);
@@ -66,6 +67,7 @@ public sealed class Plugin : LabApi.Loader.Features.Plugins.Plugin<Config>
             session.Dispose();
 
         _sessions.Clear();
+        KeepAwake(false);
         _store?.Dispose();
         Instance = null;
     }
@@ -142,6 +144,18 @@ public sealed class Plugin : LabApi.Loader.Features.Plugins.Plugin<Config>
         sender.Respond("VisualLab dashboard: " + session.Link, true);
     }
 
+    private void KeepAwake(bool wanted)
+    {
+        if (wanted == _keepingAwake)
+            return;
+
+        if (wanted && Server.PauseIdleMode)
+            return;
+
+        _keepingAwake = wanted;
+        Server.PauseIdleMode = wanted;
+    }
+
     private IEnumerator<float> Pump()
     {
         while (!_lifetime.IsCancellationRequested)
@@ -159,6 +173,16 @@ public sealed class Plugin : LabApi.Loader.Features.Plugins.Plugin<Config>
             }
 
             _sessions.RemoveAll(session => session.Closed);
+            KeepAwake(_sessions.Exists(session => session.HasClients));
+            try
+            {
+                _store.Tick();
+            }
+            catch (Exception e)
+            {
+                Logger.Error("[VisualLab] " + e);
+            }
+
             yield return Timing.WaitForOneFrame;
         }
     }

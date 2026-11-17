@@ -1,13 +1,17 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using LabApi.Events.Arguments.Interfaces;
 using MEC;
 using PlayerStatsSystem;
+using VisualLab.Bindings;
 using VisualLab.Graphs;
 using VisualLab.Logging;
 using VisualLab.Runtime.Nodes;
+using VisualLab.Serialization;
+using VisualLab.Storage;
 
 namespace VisualLab.Runtime;
 
@@ -16,9 +20,19 @@ public sealed class GraphRuntime
 {
     private const int MaxSteps = 100000;
     private const int MaxDepth = 256;
+    private const int MaxFaults = 200;
+    private const double MaxBusyMilliseconds = 5000;
+    private const double WindowMilliseconds = 10000;
+    private const double TraceGapMilliseconds = 200;
 
     private readonly HashSet<CoroutineHandle> _coroutines = new ();
     private readonly HashSet<string> _warnedOnce = new (StringComparer.Ordinal);
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
+    private double _windowStart;
+    private double _windowBusy;
+    private int _windowFaults;
+    private double _lastTrace = double.MinValue;
+    private int _nesting;
 
     /// <summary>Initializes a new instance of the <see cref="GraphRuntime"/> class.</summary>
     /// <param name="pluginId">The graph plugin ID.</param>
@@ -54,6 +68,30 @@ public sealed class GraphRuntime
     /// <summary>Gets the graph name.</summary>
     public string Name => Graph.Name;
 
+    /// <summary>Gets or sets the values this graph keeps on disk.</summary>
+    public SavedData Data { get; set; }
+
+    /// <summary>Gets or sets a value indicating whether chains report what they ran.</summary>
+    public bool Tracing { get; set; }
+
+    /// <summary>Gets or sets the callback that receives dashboard pushes.</summary>
+    public Action<JsonObject> Pushed { get; set; }
+
+    /// <summary>Gets or sets the callback that runs when the graph pauses itself.</summary>
+    public Action<string> Paused { get; set; }
+
+    /// <summary>Gets the number of chains started.</summary>
+    public long Runs { get; private set; }
+
+    /// <summary>Gets the number of runtime errors.</summary>
+    public long Faults { get; private set; }
+
+    /// <summary>Gets the total time spent running chains in milliseconds.</summary>
+    public double TotalMilliseconds { get; private set; }
+
+    /// <summary>Gets the longest chain time in milliseconds.</summary>
+    public double MaxMilliseconds { get; private set; }
+
     /// <summary>Gets the default value for a CLR type.</summary>
     /// <param name="type">The requested type.</param>
     /// <returns>The default value, or null.</returns>
@@ -77,6 +115,10 @@ public sealed class GraphRuntime
             return;
 
         Running = true;
+        _windowStart = _clock.Elapsed.TotalMilliseconds;
+        _windowBusy = 0;
+        _windowFaults = 0;
+        LoadSavedVariables();
         foreach (RuntimeNode node in Nodes.Values)
         {
             try
@@ -134,9 +176,64 @@ public sealed class GraphRuntime
             return;
 
         ExecutionFrame frame = new () { EventNode = eventNode, EventArgs = args };
-        Follow(eventNode, "then", frame);
-        if (args != null)
-            WriteOutcomes(eventNode, frame);
+        Measure(eventNode, frame, () =>
+        {
+            Follow(eventNode, "then", frame);
+            if (args != null && eventNode.Implementation.WritesOutcomes)
+                WriteOutcomes(eventNode, frame);
+        });
+    }
+
+    /// <summary>Runs a local function with a separate parameter scope and shared execution budget.</summary>
+    /// <param name="call">The call node.</param>
+    /// <param name="parent">The calling frame.</param>
+    public void CallFunction(RuntimeNode call, ExecutionFrame parent)
+    {
+        if (!Nodes.TryGetValue(call.Graph.FunctionId, out RuntimeNode entry) || entry.Graph.Type != "event.function")
+            throw new InvalidOperationException("The local function does not exist.");
+
+        if (parent.FunctionDepth >= 32)
+            throw new InvalidOperationException("Function recursion limit exceeded.");
+
+        Dictionary<string, object> arguments = new (StringComparer.Ordinal);
+        foreach (GraphParameter parameter in entry.Graph.Parameters)
+            arguments[parameter.Id] = Values.Coerce(Raw(call, parameter.Id, parent), TypeResolver.ForPin(parameter.Type));
+
+        long faults = Faults;
+        ExecutionFrame child = new () { EventNode = entry, EventArgs = arguments, Depth = parent.Depth, FunctionDepth = parent.FunctionDepth + 1, Steps = parent.Steps, Trace = parent.Trace };
+        child.Trace?.Ran(entry.Id);
+        Follow(entry, "then", child);
+        parent.Steps = child.Steps;
+        if (parent.Steps >= MaxSteps || Faults != faults)
+            parent.Stopped = true;
+    }
+
+    /// <summary>Continues a chain that was waiting.</summary>
+    /// <param name="node">The node that waited.</param>
+    /// <param name="pin">The exec output to follow.</param>
+    /// <param name="frame">The saved execution frame.</param>
+    public void Resume(RuntimeNode node, string pin, ExecutionFrame frame)
+    {
+        if (!Running)
+            return;
+
+        Measure(frame.EventNode ?? node, frame, () => Follow(node, pin, frame));
+    }
+
+    /// <summary>Saves a persistent variable after it changed.</summary>
+    /// <param name="variable">The variable definition.</param>
+    /// <param name="value">The new value.</param>
+    public void VariableChanged(GraphVariable variable, object value)
+    {
+        if (variable.Persistent && Data != null)
+            Data.SetVariable(variable.Id, Values.ToLiteral(value));
+    }
+
+    /// <summary>Counts a runtime error and pauses the graph when it keeps failing.</summary>
+    public void Fault()
+    {
+        Faults++;
+        _windowFaults++;
     }
 
     /// <summary>Runs the node connected to an execution output.</summary>
@@ -178,37 +275,9 @@ public sealed class GraphRuntime
     /// <returns>The output value.</returns>
     public object Output(RuntimeNode source, string pin, ExecutionFrame frame)
     {
-        if (source.Implementation.Pure)
-        {
-            string key = ExecutionFrame.Key(source, pin);
-            try
-            {
-                if (!frame.Evaluating.Add(key))
-                    throw new InvalidOperationException("Cyclic data dependency.");
-
-                if (frame.Evaluating.Count > MaxDepth)
-                    throw new InvalidOperationException("Data dependency is too deep.");
-
-                return source.Implementation.Eval(this, source, pin, frame);
-            }
-            catch (Exception e)
-            {
-                Log(LogLevel.Error, Unwrap(e).Message, source.Id);
-                return Default(source.Implementation.OutputType(pin));
-            }
-            finally
-            {
-                frame.Evaluating.Remove(key);
-            }
-        }
-
-        if (frame.Outputs.TryGetValue(ExecutionFrame.Key(source, pin), out object value))
-            return value;
-
-        if (frame.EventNode == source)
-            return source.Implementation.Eval(this, source, pin, frame);
-
-        return Default(source.Implementation.OutputType(pin));
+        object value = Resolve(source, pin, frame);
+        frame.Trace?.Read(source.Id, pin, value);
+        return value;
     }
 
     /// <summary>Stores an output value for the current chain.</summary>
@@ -256,6 +325,120 @@ public sealed class GraphRuntime
     {
         if (_warnedOnce.Add(nodeId + "\n" + key))
             Log(level, message, nodeId);
+    }
+
+    private object Resolve(RuntimeNode source, string pin, ExecutionFrame frame)
+    {
+        if (source.Implementation.Pure)
+        {
+            string key = ExecutionFrame.Key(source, pin);
+            try
+            {
+                if (!frame.Evaluating.Add(key))
+                    throw new InvalidOperationException("Cyclic data dependency.");
+
+                if (frame.Evaluating.Count > MaxDepth)
+                    throw new InvalidOperationException("Data dependency is too deep.");
+
+                return source.Implementation.Eval(this, source, pin, frame);
+            }
+            catch (Exception e)
+            {
+                Fault();
+                Log(LogLevel.Error, Unwrap(e).Message, source.Id);
+                return Default(source.Implementation.OutputType(pin));
+            }
+            finally
+            {
+                frame.Evaluating.Remove(key);
+            }
+        }
+
+        if (frame.Outputs.TryGetValue(ExecutionFrame.Key(source, pin), out object value))
+            return value;
+
+        if (frame.EventNode == source)
+            return source.Implementation.Eval(this, source, pin, frame);
+
+        return Default(source.Implementation.OutputType(pin));
+    }
+
+    private void LoadSavedVariables()
+    {
+        if (Data == null)
+            return;
+
+        foreach (GraphVariable variable in Graph.Variables)
+        {
+            if (variable.Id != null && variable.Persistent && Data.TryGetVariable(variable.Id, out object saved))
+                Variables[variable.Id] = Values.Literal(saved, variable.Type);
+        }
+    }
+
+    private void Measure(RuntimeNode eventNode, ExecutionFrame frame, Action run)
+    {
+        double started = _clock.Elapsed.TotalMilliseconds;
+        bool outermost = _nesting == 0;
+        if (Tracing && frame.Trace == null && started - _lastTrace >= TraceGapMilliseconds)
+        {
+            frame.Trace = new TraceRecord();
+            frame.Trace.Ran(eventNode.Id);
+            _lastTrace = started;
+        }
+
+        _nesting++;
+        try
+        {
+            run();
+        }
+        finally
+        {
+            _nesting--;
+            double elapsed = _clock.Elapsed.TotalMilliseconds - started;
+            Runs++;
+            if (outermost)
+            {
+                TotalMilliseconds += elapsed;
+                _windowBusy += elapsed;
+            }
+
+            if (elapsed > MaxMilliseconds)
+                MaxMilliseconds = elapsed;
+
+            if (frame.Trace != null)
+            {
+                Pushed?.Invoke(frame.Trace.ToPush(PluginId, eventNode.Id, Math.Round(elapsed, 3), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                frame.Trace = null;
+            }
+
+            if (outermost)
+                CheckBreaker();
+        }
+    }
+
+    private void CheckBreaker()
+    {
+        double now = _clock.Elapsed.TotalMilliseconds;
+        string reason = _windowFaults > MaxFaults
+            ? $"paused after {_windowFaults} errors in a few seconds; fix the errors and save to start it again"
+            : _windowBusy > MaxBusyMilliseconds
+                ? $"paused because it used {Math.Round(_windowBusy)} ms of server time in a few seconds; make it lighter and save to start it again"
+                : null;
+
+        if (reason != null && Running)
+        {
+            Log(LogLevel.Error, reason);
+            Stop();
+            Paused?.Invoke(reason);
+            return;
+        }
+
+        if (now - _windowStart > WindowMilliseconds)
+        {
+            _windowStart = now;
+            _windowBusy = 0;
+            _windowFaults = 0;
+        }
     }
 
     private void Compile()
@@ -372,6 +555,7 @@ public sealed class GraphRuntime
             return;
         }
 
+        frame.Trace?.Ran(node.Id);
         try
         {
             if (++frame.Depth > MaxDepth)
@@ -381,6 +565,7 @@ public sealed class GraphRuntime
         }
         catch (Exception e)
         {
+            Fault();
             if (!frame.Stopped)
                 Log(LogLevel.Error, Unwrap(e).Message, node.Id);
 
@@ -429,6 +614,7 @@ public sealed class GraphRuntime
             }
             catch (Exception e)
             {
+                Fault();
                 Log(LogLevel.Error, $"couldn't set {pin}: {Unwrap(e).Message}", node.Id);
             }
         }

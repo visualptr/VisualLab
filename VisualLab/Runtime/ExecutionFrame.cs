@@ -25,6 +25,12 @@ public sealed class ExecutionFrame
     /// <summary>Gets or sets the current execution depth.</summary>
     public int Depth { get; set; }
 
+    /// <summary>Gets or sets the synchronous function call depth.</summary>
+    public int FunctionDepth { get; set; }
+
+    /// <summary>Gets or sets the trace being recorded, if any.</summary>
+    public TraceRecord Trace { get; set; }
+
     /// <summary>Gets the output pins currently being evaluated.</summary>
     public HashSet<string> Evaluating { get; } = new ();
 

@@ -1,3 +1,4 @@
+using System;
 using VisualLab.Runtime;
 using VisualLab.Serialization;
 
@@ -23,6 +24,15 @@ internal sealed class StoredPlugin
 
     /// <summary>Gets or sets the last update time in Unix milliseconds.</summary>
     public double UpdatedAt { get; set; }
+
+    /// <summary>Gets or sets the values the graph keeps on disk.</summary>
+    public SavedData Data { get; set; }
+
+    /// <summary>Gets or sets the time until which chains report what they ran.</summary>
+    public DateTime DebugUntil { get; set; }
+
+    /// <summary>Gets or sets the run count last reported to dashboards.</summary>
+    public long ReportedRuns { get; set; }
 
     /// <summary>Gets or sets the active graph runtime.</summary>
     public GraphRuntime Runtime { get; set; }

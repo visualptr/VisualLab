@@ -2,6 +2,8 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using CustomPlayerEffects;
+using Interactables.Interobjects.DoorUtils;
 using LabApi.Features.Wrappers;
 using MapGeneration;
 using MEC;
@@ -10,7 +12,9 @@ using PlayerStatsSystem;
 using UnityEngine;
 using VisualLab.Bindings;
 using VisualLab.Graphs;
+using VisualLab.Logging;
 using VisualLab.Runtime.Nodes;
+using VisualLab.Runtime.Payloads;
 using Random = System.Random;
 
 namespace VisualLab.Runtime;
@@ -91,6 +95,26 @@ public static class Builtins
         ["text.toUpper"] = () => Pure((rt, n, f) => Text(rt, n, "text", f).ToUpperInvariant()),
         ["text.toLower"] = () => Pure((rt, n, f) => Text(rt, n, "text", f).ToLowerInvariant()),
         ["text.length"] = () => Pure((rt, n, f) => Text(rt, n, "text", f).Length),
+        ["text.startsWith"] = () => Pure((rt, n, f) => Text(rt, n, "text", f).StartsWith(Text(rt, n, "search", f), StringComparison.OrdinalIgnoreCase)),
+        ["text.endsWith"] = () => Pure((rt, n, f) => Text(rt, n, "text", f).EndsWith(Text(rt, n, "search", f), StringComparison.OrdinalIgnoreCase)),
+        ["text.substring"] = () => Pure((rt, n, f) =>
+        {
+            string text = Text(rt, n, "text", f);
+            int start = Math.Min(Math.Max(0, rt.In<int>(n, "start", f)), text.Length);
+            int length = rt.In<int>(n, "length", f);
+            return length <= 0 || start + length > text.Length ? text.Substring(start) : text.Substring(start, length);
+        }),
+        ["text.replace"] = () => Pure((rt, n, f) =>
+        {
+            string search = Text(rt, n, "search", f);
+            return search.Length == 0 ? Text(rt, n, "text", f) : Text(rt, n, "text", f).Replace(search, Text(rt, n, "replacement", f));
+        }),
+        ["text.trim"] = () => Pure((rt, n, f) => Text(rt, n, "text", f).Trim()),
+        ["text.split"] = () => Pure((rt, n, f) =>
+        {
+            string separator = Text(rt, n, "separator", f);
+            return Text(rt, n, "text", f).Split(new[] { separator.Length == 0 ? " " : separator }, StringSplitOptions.RemoveEmptyEntries).ToList();
+        }),
         ["text.color"] = () => Pure((rt, n, f) =>
             $"<color=#{ColorUtility.ToHtmlStringRGBA(rt.In<Color>(n, "color", f)).ToLowerInvariant()}>{Text(rt, n, "text", f)}</color>"),
 
@@ -109,7 +133,101 @@ public static class Builtins
         ["convert.intToFloat"] = () => Pure((rt, n, f) => (float)rt.In<int>(n, "value", f)),
         ["convert.floatToInt"] = () => Pure((rt, n, f) => (int)Math.Truncate(rt.Num(n, "value", f))),
 
+        ["convert.textToNumber"] = () => new PureNode(
+            (rt, n, pin, f) =>
+            {
+                bool ok = float.TryParse(Text(rt, n, "text", f).Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float number);
+                return pin == "ok" ? ok : ok ? number : 0f;
+            }),
+
         ["event.interval"] = () => new IntervalNode(),
+        ["event.command"] = () => new CommandNode(),
+        ["event.function"] = () => new FunctionNode(),
+        ["function.call"] = () => new ExecNode((rt, n, f) =>
+        {
+            rt.CallFunction(n, f);
+            rt.Follow(n, "then", f);
+        }),
+        ["event.signal"] = () => new SignalNode(),
+        ["event.setting.slider"] = () => new SettingNode(),
+        ["event.setting.toggle"] = () => new SettingNode(),
+        ["event.setting.dropdown"] = () => new SettingNode(),
+        ["event.setting.text"] = () => new SettingNode(),
+        ["setting.number"] = () => Pure((rt, n, f) => Keybinds.Read(rt, Text(rt, n, "name", f), rt.Raw(n, "player", f) as Player)?.Number ?? 0f),
+        ["setting.enabled"] = () => Pure((rt, n, f) => Keybinds.Read(rt, Text(rt, n, "name", f), rt.Raw(n, "player", f) as Player)?.Enabled ?? false),
+        ["setting.index"] = () => Pure((rt, n, f) => Keybinds.Read(rt, Text(rt, n, "name", f), rt.Raw(n, "player", f) as Player)?.Index ?? 0),
+        ["setting.text"] = () => Pure((rt, n, f) => Keybinds.Read(rt, Text(rt, n, "name", f), rt.Raw(n, "player", f) as Player)?.Text ?? string.Empty),
+        ["event.keybind"] = () => new KeybindNode(),
+        ["command.reply"] = () => new ExecNode((rt, n, f) =>
+        {
+            if (f.EventArgs is CommandCall call)
+                call.Reply(Text(rt, n, "message", f), rt.In<bool>(n, "success", f));
+            else
+                rt.LogOnce("reply", LogLevel.Warn, "reply only works in a chain started by a command", n.Id);
+
+            rt.Follow(n, "then", f);
+        }),
+        ["signal.send"] = () => new ExecNode((rt, n, f) =>
+        {
+            string name = Text(rt, n, "name", f).Trim();
+            if (name.Length > 0)
+                SignalBus.Send(name, new SignalCall { Text = Text(rt, n, "text", f), Number = rt.Num(n, "number", f), Player = rt.Raw(n, "player", f) as Player });
+
+            rt.Follow(n, "then", f);
+        }),
+
+        ["save.getNumber"] = () => Pure((rt, n, f) => Saved(rt, n, f) is double number ? (float)number : rt.Num(n, "fallback", f)),
+        ["save.getText"] = () => Pure((rt, n, f) => Saved(rt, n, f) is object saved ? Values.ToText(saved) : Text(rt, n, "fallback", f)),
+        ["save.setNumber"] = () => new ExecNode((rt, n, f) =>
+        {
+            Save(rt, n, f, (double)rt.Num(n, "value", f));
+            rt.Follow(n, "then", f);
+        }),
+        ["save.setText"] = () => new ExecNode((rt, n, f) =>
+        {
+            Save(rt, n, f, Text(rt, n, "value", f));
+            rt.Follow(n, "then", f);
+        }),
+        ["save.addNumber"] = () => new ExecNode((rt, n, f) =>
+        {
+            double total = (Saved(rt, n, f) is double number ? number : 0) + rt.Num(n, "amount", f);
+            Save(rt, n, f, total);
+            rt.SetOutput(n, "value", f, (float)total);
+            rt.Follow(n, "then", f);
+        }),
+        ["save.delete"] = () => new ExecNode((rt, n, f) =>
+        {
+            Save(rt, n, f, null);
+            rt.Follow(n, "then", f);
+        }),
+
+        ["logic.select"] = () => Pure((rt, n, f) =>
+        {
+            object picked = rt.Raw(n, rt.In<bool>(n, "condition", f) ? "a" : "b", f);
+            return picked is Unset ? null : picked;
+        }),
+        ["logic.hasFlag"] = () => Pure((rt, n, f) =>
+        {
+            object value = rt.Raw(n, "value", f);
+            if (value == null || value is Unset || !value.GetType().IsEnum)
+                return false;
+
+            long flag = Convert.ToInt64(Values.ToEnum(rt.Raw(n, "flag", f), value.GetType()));
+            return flag != 0 && (Convert.ToInt64(value) & flag) == flag;
+        }),
+        ["helper.findPlayer"] = () => Pure((rt, n, f) => FindPlayer(Text(rt, n, "text", f).Trim())),
+        ["helper.hasKeycardFor"] = () => Pure((rt, n, f) =>
+        {
+            if (rt.Raw(n, "player", f) is not Player player || rt.Raw(n, "door", f) is not Door door || !Values.IsValid(player) || door.Base == null)
+                return false;
+
+            DoorPermissionsPolicy policy = door.Base.PermissionsPolicy;
+            return policy.RequiredPermissions == DoorPermissionFlags.None
+                || player.Items.Any(item => item?.Base is IDoorPermissionProvider provider && policy.CheckPermissions(provider.GetPermissions(door.Base)));
+        }),
+        ["effect.isActive"] = () => Pure((rt, n, f) => Effect(rt, n, f)?.IsEnabled ?? false),
+        ["effect.intensity"] = () => Pure((rt, n, f) => (int)(Effect(rt, n, f)?.Intensity ?? 0)),
+        ["effect.timeLeft"] = () => Pure((rt, n, f) => Effect(rt, n, f) is StatusEffectBase effect && effect.IsEnabled ? effect.TimeLeft : 0f),
         ["helper.alivePlayers"] = () => Pure((rt, n, f) => Ready.Where(player => player.IsAlive).ToList()),
         ["helper.playersWithRole"] = () => Pure((rt, n, f) =>
         {
@@ -137,6 +255,22 @@ public static class Builtins
             return index < 0 ? null : List(rt, n, f).ElementAtOrDefault(index);
         }),
         ["list.isEmpty"] = () => Pure((rt, n, f) => !List(rt, n, f).Any()),
+        ["list.add"] = () => Pure((rt, n, f) =>
+        {
+            List<object> list = List(rt, n, f).ToList();
+            list.Add(rt.Raw(n, "value", f));
+            return list;
+        }),
+        ["list.remove"] = () => Pure((rt, n, f) =>
+        {
+            object value = rt.Raw(n, "value", f);
+            List<object> list = List(rt, n, f).ToList();
+            int index = list.FindIndex(item => Values.Same(item, value));
+            if (index >= 0)
+                list.RemoveAt(index);
+
+            return list;
+        }),
         ["list.contains"] = () => Pure((rt, n, f) =>
         {
             object value = rt.Raw(n, "value", f);
@@ -224,6 +358,60 @@ public static class Builtins
         return sequence.Cast<object>().ToList();
     }
 
+    private static StatusEffectBase Effect(GraphRuntime runtime, RuntimeNode node, ExecutionFrame frame)
+    {
+        if (runtime.Raw(node, "player", frame) is not Player player || !Values.IsValid(player))
+            return null;
+
+        return player.TryGetEffect(Text(runtime, node, "effect", frame).Trim(), out StatusEffectBase effect) ? effect : null;
+    }
+
+    private static Player FindPlayer(string text)
+    {
+        if (text.Length == 0)
+            return null;
+
+        List<Player> ready = Ready.ToList();
+        if (int.TryParse(text, out int id) && ready.FirstOrDefault(player => player.PlayerId == id) is Player byId)
+            return byId;
+
+        return ready.FirstOrDefault(player => string.Equals(player.UserId, text, StringComparison.OrdinalIgnoreCase))
+            ?? ready.FirstOrDefault(player => string.Equals(player.Nickname, text, StringComparison.OrdinalIgnoreCase))
+            ?? ready.FirstOrDefault(player => player.Nickname != null && player.Nickname.IndexOf(text, StringComparison.OrdinalIgnoreCase) >= 0);
+    }
+
+    private static string Owner(GraphRuntime runtime, RuntimeNode node, ExecutionFrame frame)
+    {
+        object player = runtime.Raw(node, "player", frame);
+        if (player is Unset || player == null)
+            return null;
+
+        if (player is not Player owner || !Values.IsValid(owner) || string.IsNullOrEmpty(owner.UserId))
+            throw new InvalidOperationException("the player is empty, so their saved value can't be used");
+
+        return owner.UserId;
+    }
+
+    private static string Key(GraphRuntime runtime, RuntimeNode node, ExecutionFrame frame)
+    {
+        string key = Text(runtime, node, "key", frame).Trim();
+        if (key.Length == 0 || key.Length > 200)
+            throw new InvalidOperationException("a saved value needs a key of 1 to 200 characters");
+
+        return key;
+    }
+
+    private static object Saved(GraphRuntime runtime, RuntimeNode node, ExecutionFrame frame) =>
+        runtime.Data?.Get(Key(runtime, node, frame), Owner(runtime, node, frame));
+
+    private static void Save(GraphRuntime runtime, RuntimeNode node, ExecutionFrame frame, object value)
+    {
+        if (runtime.Data == null)
+            throw new InvalidOperationException("saved values aren't available here");
+
+        runtime.Data.Set(Key(runtime, node, frame), Owner(runtime, node, frame), value);
+    }
+
     private static void Delay(GraphRuntime runtime, RuntimeNode node, ExecutionFrame frame)
     {
         float seconds = Math.Max(0f, runtime.Num(node, "seconds", frame));
@@ -235,7 +423,7 @@ public static class Builtins
             if (!runtime.Running)
                 return;
 
-            runtime.Follow(node, "completed", continuation);
+            runtime.Resume(node, "completed", continuation);
         });
 
         runtime.Track(handle);
@@ -322,6 +510,7 @@ public static class Builtins
         {
             object value = rt.In(n, "value", f, type);
             rt.Variables[variable.Id] = value;
+            rt.VariableChanged(variable, value);
             rt.SetOutput(n, "value", f, value);
             rt.Follow(n, "then", f);
         });

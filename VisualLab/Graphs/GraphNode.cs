@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using VisualLab.Runtime;
 using VisualLab.Serialization;
 
@@ -17,6 +18,12 @@ public sealed class GraphNode
 
     /// <summary>Gets or sets the concrete type of a generic node.</summary>
     public string TypeArg { get; set; }
+
+    /// <summary>Gets or sets the local function entry identifier.</summary>
+    public string FunctionId { get; set; }
+
+    /// <summary>Gets or sets the function parameters.</summary>
+    public List<GraphParameter> Parameters { get; set; } = new ();
 
     /// <summary>Gets or sets the input literals.</summary>
     public JsonObject Values { get; set; } = new ();

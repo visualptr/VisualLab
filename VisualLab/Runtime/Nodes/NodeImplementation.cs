@@ -9,6 +9,9 @@ public abstract class NodeImplementation
     /// <summary>Gets a value indicating whether the node is evaluated without an execution wire.</summary>
     public virtual bool Pure => false;
 
+    /// <summary>Gets a value indicating whether the node's inputs change its event after the chain runs.</summary>
+    public virtual bool WritesOutcomes => false;
+
     /// <summary>Evaluates a node output.</summary>
     /// <param name="runtime">The graph runtime.</param>
     /// <param name="node">The runtime node.</param>

@@ -20,6 +20,9 @@ public sealed class EventNode : NodeImplementation
         _binding = binding;
     }
 
+    /// <summary>Gets a value indicating whether the node's inputs change its event after the chain runs.</summary>
+    public override bool WritesOutcomes => true;
+
     /// <summary>Subscribes the node to its LabAPI event.</summary>
     /// <param name="runtime">The graph runtime.</param>
     /// <param name="node">The runtime node.</param>

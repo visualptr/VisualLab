@@ -50,16 +50,22 @@ public sealed class GraphFile
                 Id = variable.Str("id"),
                 Name = variable.Str("name"),
                 Type = variable.Str("type"),
+                Persistent = variable.Bool("persistent"),
                 Default = variable.TryGetValue("default", out object fallback) ? fallback : null,
             });
         }
 
         foreach (JsonObject node in json.Arr("nodes").OfType<JsonObject>())
         {
+            if (node.TryGetValue("parameters", out object parameters) && (parameters is not List<object> list || list.Any(parameter => parameter is not JsonObject)))
+                throw new FormatException("Invalid function parameters.");
+
             graph.Nodes.Add(new GraphNode
             {
                 Id = node.Str("id"),
                 Type = node.Str("type"),
+                FunctionId = node.Str("function"),
+                Parameters = (node.Arr("parameters") ?? new List<object>()).OfType<JsonObject>().Select(parameter => new GraphParameter { Id = parameter.Str("id"), Name = parameter.Str("name"), Type = parameter.Str("type") }).ToList(),
                 VarId = node.Str("variable"),
                 TypeArg = node.Str("typeArg"),
                 Values = node.Obj("values") ?? new JsonObject(),

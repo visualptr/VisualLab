@@ -6,7 +6,7 @@
     <Nullable>disable</Nullable>
     <AssemblyName>VisualLab</AssemblyName>
     <RootNamespace>VisualLab</RootNamespace>
-    <Version>0.1.2</Version>
+    <Version>0.2.0</Version>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
     <SL_MANAGED Condition="'$(SL_MANAGED)' == ''">C:\Program Files (x86)\Steam\steamapps\common\SCP Secret Laboratory Dedicated Server\SCPSL_Data\Managed</SL_MANAGED>
   </PropertyGroup>
@@ -21,6 +21,7 @@
     <Reference Include="Assembly-CSharp" HintPath="$(SL_MANAGED)\Assembly-CSharp.dll" Private="false" />
     <Reference Include="Assembly-CSharp-firstpass" HintPath="$(SL_MANAGED)\Assembly-CSharp-firstpass.dll" Private="false" />
     <Reference Include="CommandSystem.Core" HintPath="$(SL_MANAGED)\CommandSystem.Core.dll" Private="false" />
+    <Reference Include="Unity.TextMeshPro" HintPath="$(SL_MANAGED)\Unity.TextMeshPro.dll" Private="false" />
     <Reference Include="Mirror" HintPath="$(SL_MANAGED)\Mirror.dll" Private="false" />
     <Reference Include="UnityEngine.CoreModule" HintPath="$(SL_MANAGED)\UnityEngine.CoreModule.dll" Private="false" />
   </ItemGroup>

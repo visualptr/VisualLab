@@ -12,6 +12,9 @@ public sealed class GraphVariable
     /// <summary>Gets or sets the catalog type name.</summary>
     public string Type { get; set; }
 
+    /// <summary>Gets or sets a value indicating whether the value survives restarts.</summary>
+    public bool Persistent { get; set; }
+
     /// <summary>Gets or sets the variable default value.</summary>
     public object Default { get; set; }
 }

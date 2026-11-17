@@ -56,6 +56,9 @@ public sealed class RelayConnection : IDisposable
     /// <summary>Gets the private dashboard link. The key lives only in its #fragment.</summary>
     public string Link { get; }
 
+    /// <summary>Gets a value indicating whether a dashboard is connected to this session.</summary>
+    public bool HasClients => !Closed && _clients.Count > 0;
+
     /// <summary>Gets a value indicating whether the dashboard session is closed.</summary>
     public bool Closed => _stop.IsCancellationRequested;
 

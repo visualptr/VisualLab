@@ -275,6 +275,29 @@ public static class Values
         }
     }
 
+    /// <summary>Converts a value to a JSON literal that can be read back later.</summary>
+    /// <param name="value">The value to use.</param>
+    /// <returns>The literal, or null if the value can't be saved.</returns>
+    public static object ToLiteral(object value)
+    {
+        switch (value)
+        {
+            case null:
+            case Unset:
+                return null;
+            case string or bool:
+                return value;
+            case Vector3 or Vector2 or Color:
+                return ToText(value);
+            case Enum:
+                return value.ToString();
+            case IEnumerable sequence:
+                return sequence.Cast<object>().Select(ToLiteral).Where(item => item != null).ToList();
+        }
+
+        return IsNumber(value) ? Convert.ToDouble(value, Invariant) : null;
+    }
+
     private static bool IsInteger(Type type) =>
         type == typeof(int) || type == typeof(long) || type == typeof(short) || type == typeof(byte) || type == typeof(sbyte) ||
         type == typeof(uint) || type == typeof(ulong) || type == typeof(ushort);

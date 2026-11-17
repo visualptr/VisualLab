@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using VisualLab.Graphs;
@@ -13,8 +14,15 @@ namespace VisualLab.Storage;
 /// <summary>Loads, saves, and runs graph plugins.</summary>
 public sealed class PluginStore : IDisposable
 {
+    private const int MaxHistory = 20;
+    private const double FlushSeconds = 10;
+    private const double StatsSeconds = 3;
+    private const double DebugMinutes = 10;
+
     private readonly string _folder;
     private readonly Dictionary<string, StoredPlugin> _entries = new ();
+    private DateTime _nextFlush = DateTime.UtcNow;
+    private DateTime _nextStats = DateTime.UtcNow;
 
     /// <summary>Initializes a new instance of the <see cref="PluginStore"/> class.</summary>
     /// <param name="folder">The graph storage folder.</param>
@@ -53,7 +61,7 @@ public sealed class PluginStore : IDisposable
                 id = "p_" + Guid.NewGuid().ToString("N");
                 JsonObject graph = request.Obj("graph");
                 Compile(id, graph);
-                StoredPlugin entry = new () { Id = id, Graph = graph, Enabled = request.Bool("enabled"), Revision = 1, UpdatedAt = Now };
+                StoredPlugin entry = new () { Id = id, Graph = graph, Enabled = request.Bool("enabled"), Revision = 1, UpdatedAt = Now, Data = DataFor(id) };
                 WriteAtomic(GraphPath(id), Json.Write(graph, true));
                 _entries[id] = entry;
                 WriteIndex();
@@ -70,6 +78,7 @@ public sealed class PluginStore : IDisposable
                 JsonObject graph = request.Obj("graph");
                 Compile(id, graph);
                 WriteAtomic(GraphPath(id), Json.Write(graph, true));
+                Archive(entry);
                 entry.Graph = graph;
                 entry.Revision++;
                 entry.UpdatedAt = Now;
@@ -92,9 +101,39 @@ public sealed class PluginStore : IDisposable
                 StoredPlugin entry = Find(id);
                 File.Delete(GraphPath(entry.Id));
                 entry.Runtime?.Stop();
+                entry.Data.Delete();
+                if (Directory.Exists(HistoryFolder(entry.Id)))
+                    Directory.Delete(HistoryFolder(entry.Id), true);
+
                 _entries.Remove(entry.Id);
                 WriteIndex();
                 Changed?.Invoke(new JsonObject { ["event"] = "pluginDeleted", ["id"] = entry.Id });
+                return new JsonObject();
+            }
+
+            case "history":
+            {
+                StoredPlugin entry = Find(id);
+                return new JsonObject { ["revisions"] = Revisions(entry) };
+            }
+
+            case "getRevision":
+            {
+                StoredPlugin entry = Find(id);
+                string path = Path.Combine(HistoryFolder(entry.Id), ((long)request.Num("revision", -1)).ToString(CultureInfo.InvariantCulture) + ".vlab.json");
+                if (!File.Exists(path))
+                    throw new ProtocolException("not_found", "That version is no longer kept.");
+
+                return new JsonObject { ["graph"] = Json.ParseObject(File.ReadAllText(path)) };
+            }
+
+            case "debug":
+            {
+                StoredPlugin entry = Find(id);
+                entry.DebugUntil = request.Bool("enabled") ? DateTime.UtcNow.AddMinutes(DebugMinutes) : DateTime.MinValue;
+                if (entry.Runtime != null)
+                    entry.Runtime.Tracing = request.Bool("enabled");
+
                 return new JsonObject();
             }
 
@@ -107,10 +146,49 @@ public sealed class PluginStore : IDisposable
     public void Dispose()
     {
         foreach (StoredPlugin entry in _entries.Values)
+        {
             entry.Runtime?.Stop();
+            Flush(entry, true);
+        }
     }
 
-    private static void WriteAtomic(string path, string content)
+    /// <summary>Writes saved values and reports graph statistics; call it every frame.</summary>
+    public void Tick()
+    {
+        DateTime now = DateTime.UtcNow;
+        if (now >= _nextFlush)
+        {
+            _nextFlush = now.AddSeconds(FlushSeconds);
+            foreach (StoredPlugin entry in _entries.Values)
+            {
+                Flush(entry);
+                if (entry.Runtime != null && entry.Runtime.Tracing && now > entry.DebugUntil)
+                    entry.Runtime.Tracing = false;
+            }
+        }
+
+        if (now < _nextStats || Changed == null)
+            return;
+
+        _nextStats = now.AddSeconds(StatsSeconds);
+        JsonObject changed = new ();
+        foreach (StoredPlugin entry in _entries.Values)
+        {
+            if (entry.Runtime == null || entry.Runtime.Runs == entry.ReportedRuns)
+                continue;
+
+            entry.ReportedRuns = entry.Runtime.Runs;
+            changed[entry.Id] = Stats(entry.Runtime);
+        }
+
+        if (changed.Count > 0)
+            Changed.Invoke(new JsonObject { ["event"] = "stats", ["plugins"] = changed });
+    }
+
+    /// <summary>Replaces a file without leaving a partial copy.</summary>
+    /// <param name="path">The file path.</param>
+    /// <param name="content">The new file text.</param>
+    internal static void WriteAtomic(string path, string content)
     {
         string temp = path + ".tmp";
         File.WriteAllText(temp, content);
@@ -136,7 +214,81 @@ public sealed class PluginStore : IDisposable
         }
     }
 
+    private static JsonObject Stats(GraphRuntime runtime) => new ()
+    {
+        ["runs"] = (double)runtime.Runs,
+        ["errors"] = (double)runtime.Faults,
+        ["avgMs"] = runtime.Runs == 0 ? 0 : Math.Round(runtime.TotalMilliseconds / runtime.Runs, 3),
+        ["maxMs"] = Math.Round(runtime.MaxMilliseconds, 3),
+    };
+
+    private static void Flush(StoredPlugin entry, bool wait = false)
+    {
+        try
+        {
+            entry.Data.Flush(wait);
+        }
+        catch (Exception e)
+        {
+            RuntimeLog.Write(entry.Id, entry.Id, LogLevel.Error, "couldn't write saved values: " + e.Message);
+        }
+    }
+
     private string GraphPath(string id) => Path.Combine(_folder, id + ".vlab.json");
+
+    private string HistoryFolder(string id) => Path.Combine(_folder, "history", id);
+
+    private SavedData DataFor(string id) => new (Path.Combine(_folder, "data", id + ".json"));
+
+    private void Archive(StoredPlugin entry)
+    {
+        try
+        {
+            string folder = HistoryFolder(entry.Id);
+            Directory.CreateDirectory(folder);
+            File.WriteAllText(Path.Combine(folder, ((long)entry.Revision).ToString(CultureInfo.InvariantCulture) + ".vlab.json"), Json.Write(entry.Graph, true));
+            foreach (string old in Directory.GetFiles(folder, "*.vlab.json").OrderByDescending(RevisionOf).Skip(MaxHistory))
+                File.Delete(old);
+        }
+        catch (Exception e)
+        {
+            RuntimeLog.Write(entry.Id, entry.Id, LogLevel.Warn, "couldn't keep the previous version: " + e.Message);
+        }
+    }
+
+    private long RevisionOf(string file) => long.TryParse(Path.GetFileName(file).Replace(".vlab.json", string.Empty), NumberStyles.Integer, CultureInfo.InvariantCulture, out long revision) ? revision : -1;
+
+    private List<object> Revisions(StoredPlugin entry)
+    {
+        List<object> result = new ();
+        string folder = HistoryFolder(entry.Id);
+        if (!Directory.Exists(folder))
+            return result;
+
+        foreach (string file in Directory.GetFiles(folder, "*.vlab.json").OrderByDescending(RevisionOf))
+        {
+            JsonObject item = new ()
+            {
+                ["revision"] = (double)RevisionOf(file),
+                ["savedAt"] = (double)new DateTimeOffset(File.GetLastWriteTimeUtc(file)).ToUnixTimeMilliseconds(),
+            };
+
+            try
+            {
+                JsonObject graph = Json.ParseObject(File.ReadAllText(file));
+                item["nodeCount"] = (double)(graph.Arr("nodes")?.Count ?? 0);
+                item["name"] = graph.Obj("meta")?.Str("name") ?? string.Empty;
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            result.Add(item);
+        }
+
+        return result;
+    }
 
     private void Load()
     {
@@ -145,7 +297,7 @@ public sealed class PluginStore : IDisposable
         {
             string id = Path.GetFileName(file).Replace(".vlab.json", string.Empty);
             JsonObject state = index.Obj(id) ?? new JsonObject();
-            StoredPlugin entry = new () { Id = id, Enabled = state.Bool("enabled"), Revision = state.Num("revision", 1), UpdatedAt = state.Num("updatedAt", Now) };
+            StoredPlugin entry = new () { Id = id, Enabled = state.Bool("enabled"), Revision = state.Num("revision", 1), UpdatedAt = state.Num("updatedAt", Now), Data = DataFor(id) };
             _entries[id] = entry;
             try
             {
@@ -172,13 +324,25 @@ public sealed class PluginStore : IDisposable
     private void Reload(StoredPlugin entry)
     {
         entry.Runtime?.Stop();
+        Flush(entry);
         entry.Runtime = null;
         entry.Error = null;
         try
         {
-            entry.Runtime = Compile(entry.Id, entry.Graph);
+            GraphRuntime runtime = Compile(entry.Id, entry.Graph);
+            runtime.Data = entry.Data;
+            runtime.Tracing = DateTime.UtcNow < entry.DebugUntil;
+            runtime.Pushed = push => Changed?.Invoke(push);
+            runtime.Paused = reason =>
+            {
+                entry.Error = reason;
+                Publish(entry);
+            };
+
+            entry.Runtime = runtime;
+            entry.ReportedRuns = 0;
             if (entry.Enabled)
-                entry.Runtime.Start();
+                runtime.Start();
 
             if (entry.Runtime.Errors.Count > 0)
                 throw new Exception(string.Join("; ", entry.Runtime.Errors));
@@ -210,6 +374,9 @@ public sealed class PluginStore : IDisposable
             ["nodeCount"] = entry.Graph?.Arr("nodes")?.Count ?? 0,
             ["state"] = entry.Error != null ? "error" : entry.Enabled ? "running" : "disabled",
         };
+
+        if (entry.Runtime != null && entry.Runtime.Runs > 0)
+            summary["stats"] = Stats(entry.Runtime);
 
         if (entry.Error != null)
             summary["message"] = entry.Error;

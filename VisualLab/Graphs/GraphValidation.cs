@@ -209,6 +209,25 @@ public static class GraphValidation
 
     private static JsonObject Definition(GraphNode node, GraphFile graph)
     {
+        if (node.Type == "event.function" || node.Type == "function.call")
+        {
+            bool entry = node.Type == "event.function";
+            GraphNode function = entry ? node : graph.Nodes.FirstOrDefault(candidate => candidate.Id == node.FunctionId && candidate.Type == "event.function");
+            if (function == null)
+                throw new FormatException($"{node.Id}: function does not exist.");
+
+            if (function.Parameters.Count > 16 || function.Parameters.GroupBy(parameter => parameter.Id).Any(group => group.Count() > 1) || function.Parameters.Any(parameter => string.IsNullOrEmpty(parameter.Id) || string.IsNullOrWhiteSpace(parameter.Name) || new[] { "exec", "then", "name" }.Contains(parameter.Id) || !ValidParameterType(parameter.Type)))
+                throw new FormatException($"{node.Id}: functions need up to 16 uniquely identified, named parameters with concrete types.");
+
+            List<object> parameters = function.Parameters.Select(parameter => (object)Pin(parameter.Id, parameter.Type)).ToList();
+            return new JsonObject
+            {
+                ["kind"] = entry ? "event" : "action",
+                ["inputs"] = entry ? new List<object> { Pin("name", "string") } : new List<object> { Pin("exec", "exec") }.Concat(parameters).ToList(),
+                ["outputs"] = entry ? new List<object> { Pin("then", "exec") }.Concat(parameters).ToList() : new List<object> { Pin("then", "exec") },
+            };
+        }
+
         if (!node.Type.StartsWith("variable."))
             return Definitions.TryGetValue(node.Type, out JsonObject definition) ? definition : null;
 
@@ -226,6 +245,15 @@ public static class GraphValidation
             ["inputs"] = get ? new List<object>() : new List<object> { Pin("exec", "exec"), Pin("value", variable.Type) },
             ["outputs"] = get ? new List<object> { Pin("value", variable.Type) } : new List<object> { Pin("then", "exec"), Pin("value", variable.Type) },
         };
+    }
+
+    private static bool ValidParameterType(string type)
+    {
+        if (string.IsNullOrEmpty(type))
+            return false;
+
+        string element = type.EndsWith("[]", StringComparison.Ordinal) ? type.Substring(0, type.Length - 2) : type;
+        return element != "exec" && element != "any" && element != "T" && (Types.ContainsKey(element) || new[] { "string", "int", "float", "bool", "vector2", "vector3", "quaternion", "color" }.Contains(element));
     }
 
     private static string PinType(JsonObject pin, GraphNode node)
